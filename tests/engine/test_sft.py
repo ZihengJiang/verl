@@ -1,14 +1,12 @@
+# torchrun --nproc_per_node=4 test_sft.py
 import os
 import torch
 import torch.distributed as dist
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoTokenizer
 from datasets import load_dataset
 from torch.utils.data import DataLoader, Dataset
-from torch.optim import AdamW
 from torch.utils.data.distributed import DistributedSampler
-
-
+from verl.engine.fsdp import FSDPConfig, FSDPEngine
 
 # Initialize distributed training
 def setup_distributed():
@@ -63,36 +61,22 @@ def format_gsm8k_example(example, tokenizer):
     text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
     return {"text": text}
 
-# Training step
-def train_step(model, batch, optimizer, device):
-    optimizer.zero_grad()
-    input_ids = batch["input_ids"].to(device)
-    attention_mask = batch["attention_mask"].to(device)
-    labels = batch["labels"].to(device)
-    
-    with torch.cuda.amp.autocast():
-        outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-        loss = outputs.loss
-    
-    return loss.item()
 
 # Main training function
 def main():
     # Setup distributed environment
     rank, world_size = setup_distributed()
     
-    # Load tokenizer and model
-    model_id = "Qwen/Qwen2.5-0.5B-Instruct"
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id,
-        torch_dtype=torch.bfloat16,
-        device_map={"": rank}
+    # Setup traininig engine
+    config = FSDPConfig(
+        model_path = "Qwen/Qwen2.5-0.5B-Instruct"
     )
+    engine = FSDPEngine(config)
+    engine.init_model_and_optimizer()
+    loss_fn = torch.nn.CrossEntropyLoss(ignore_index=-100)
+    engine.set_loss_fn(loss_fn)
 
-    model = FSDP(
-        model
-    )
+    tokenizer = AutoTokenizer.from_pretrained(config.model_path)
     
     # Load and prepare dataset
     dataset = load_dataset("openai/gsm8k", "main")["train"]
@@ -101,7 +85,7 @@ def main():
     
     # Distributed data loader
     sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
-    dataloader = DataLoader(
+    train_loader = DataLoader(
         train_dataset,
         batch_size=4,
         sampler=sampler,
@@ -109,41 +93,26 @@ def main():
         pin_memory=True
     )
     
-    # Optimizer
-    optimizer = AdamW(model.parameters(), lr=5e-5)
-    
     # Training loop
     num_epochs = 3
-    total_steps = len(dataloader) * num_epochs
-    warmup_steps = int(0.1 * total_steps)
-    device = torch.device(f"cuda:{rank}")
+    total_steps = len(train_loader) * num_epochs
     
     for epoch in range(num_epochs):
-        sampler.set_epoch(epoch)
-        model.train()
-        total_loss = 0.0
-        for step, batch in enumerate(dataloader):
-            # Learning rate warmup
-            lr = 5e-5 * min(1.0, (step + 1 + epoch * len(dataloader)) / warmup_steps)
-            for param_group in optimizer.param_groups:
-                param_group["lr"] = lr
+        total_loss = 0
+        for step, batch in enumerate(train_loader):
+            engine.optimizer_zero_grad()
+            outputs = engine.forward_backward_step(batch)
+            loss = outputs.loss
+            engine.optimizer_step()
+            total_loss += loss.item()
             
-            loss = train_step(model, batch, optimizer, device)
-            total_loss += loss
-            
-            if rank == 0 and (step + 1) % 10 == 0:
-                print(f"Epoch {epoch+1}, Step {step+1}, Loss: {loss:.4f}")
+            if rank == 0 and step % 10 == 0:
+                step = step + epoch * len(train_loader)
+                print(f"Epoch {epoch+1}/{num_epochs}, Step {step}/{total_steps}, Loss: {loss.item():.4f}")
         
-        avg_loss = total_loss / len(dataloader)
+        avg_loss = total_loss / len(train_loader)
         if rank == 0:
-            print(f"Epoch {epoch+1} Average Loss: {avg_loss:.4f}")
-    
-    # Save model (only rank 0)
-    if rank == 0:
-        output_dir = "./qwen2.5-0.5b-sft-gsm8k"
-        os.makedirs(output_dir, exist_ok=True)
-        model.module.save_pretrained(output_dir)
-        tokenizer.save_pretrained(output_dir)
+            print(f"Epoch {epoch+1}/{num_epochs}, Average Loss: {avg_loss:.4f}")
     
     # Cleanup
     dist.destroy_process_group()
