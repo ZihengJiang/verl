@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -xeuo pipefail
 
-ENTRYPOINT=${ENTRYPOINT:-"-m verl.trainer.fsdp_sft_trainer"}
+ENTRYPOINT=${ENTRYPOINT:-"-m verl.trainer.fsdp_sft_trainer_v2"}
 
 NUM_GPUS=${NUM_GPUS:-8}
 
@@ -48,7 +48,7 @@ torchrun --standalone --nnodes=1 --nproc_per_node=${NUM_GPUS} ${ENTRYPOINT} \
     trainer.default_local_dir="${ckpts_home}" \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${exp_name}" \
-    trainer.total_training_steps=1 \
+    trainer.total_training_steps=10 \
     trainer.logger=['console'] \
     trainer.default_hdfs_dir=null $@
 

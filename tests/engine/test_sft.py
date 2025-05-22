@@ -7,7 +7,7 @@ from huggingface_hub import snapshot_download
 from datasets import load_dataset
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
-from verl.engine.fsdp import FSDPConfig, FSDPEngine
+from verl.engine.fsdp.engine_impl import FSDPConfig, FSDPEngine
 
 # Initialize distributed training
 def setup_distributed():
