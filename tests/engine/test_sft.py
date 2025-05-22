@@ -1,8 +1,9 @@
-# torchrun --nproc_per_node=4 test_sft.py
+# torchrun --nproc_per_node=4 tests/engine/test_sft.py
 import os
 import torch
 import torch.distributed as dist
 from transformers import AutoTokenizer
+from huggingface_hub import snapshot_download
 from datasets import load_dataset
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
@@ -63,13 +64,19 @@ def format_gsm8k_example(example, tokenizer):
 
 
 # Main training function
-def main():
+def main():                        
     # Setup distributed environment
     rank, world_size = setup_distributed()
+
+    # Download model from Hugging Face
+    model_name = "Qwen/Qwen2.5-0.5B-Instruct"
+    if rank == 0:
+        file_path = snapshot_download(repo_id=model_name)
+    dist.barrier()
     
     # Setup traininig engine
     config = FSDPConfig(
-        model_path = "Qwen/Qwen2.5-0.5B-Instruct"
+        model_path = model_name,
     )
     engine = FSDPEngine(config)
     engine.init_model_and_optimizer()
