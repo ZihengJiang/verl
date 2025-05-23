@@ -5,7 +5,6 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.fsdp import CPUOffload, MixedPrecision, ShardingStrategy
 from torch import nn, optim
-from torch.optim import AdamW
 from ..base import Engine
 from .config import FSDPEngineConfig
 from verl.utils.import_utils import import_external_libs
@@ -22,12 +21,6 @@ class FSDPEngine(Engine):
     def __init__(self, config: FSDPEngineConfig):
         self.config = config
         import_external_libs(self.config.model.external_lib)
-        self.use_ce_loss_fusion = self.config.model.use_ce_loss_fusion
-        # self.compute_entropy_loss = torch.compile(core_algos.compute_entropy_loss, dynamic=True)
-        # self.entropy_from_logits = torch.compile(verl_F.entropy_from_logits, dynamic=True)
-        # NOTE: loss related could set in `driver code`, only set default here
-        # self.loss_fn = default_pg_loss_fn
-        # self.loss_config = default_loss_config
         assert config.model.use_rmpad is True
         assert config.model.lora_rank == 0
         assert config.system.ulysses_sequence_parallel_size == 1
@@ -109,16 +102,32 @@ class FSDPEngine(Engine):
             betas=optim_config.betas,
             weight_decay=optim_config.weight_decay,
         )
+
+        total_steps = optim_config.total_training_steps
+        num_warmup_steps = optim_config.lr_warmup_steps
+        if num_warmup_steps < 0:
+            num_warmup_steps_ratio = optim_config.lr_warmup_steps_ratio
+            num_warmup_steps = int(num_warmup_steps_ratio * total_steps)
+
+        self.lr_scheduler = verl_F.get_constant_schedule_with_warmup(
+            optimizer=self.optimizer, num_warmup_steps=num_warmup_steps
+        )
+        # TODO(ziheng): support more lr scheduler
+        # if not hasattr(self.config.optim, "lr_scheduler") or self.config.optim.lr_scheduler == "cosine":
+        #     self.lr_scheduler = get_cosine_schedule_with_warmup(optimizer=self.optimizer, num_warmup_steps=num_warmup_steps, num_training_steps=self.total_steps)
+        # elif self.config.optim.lr_scheduler == "wsd":
+        #     self.lr_scheduler = get_wsd_schedule_with_warmup(optimizer=self.optimizer, num_warmup_steps=num_warmup_steps, num_training_steps=self.total_steps)
+        # else:
+        #     raise ValueError(f"Unknown lr scheduler: {self.config.optim.lr_scheduler}")
         
 
-    def forward_backward_step(self, batch):
+    def forward_backward_step(self, batch, forward_only=False):
         self.model.train()
 
         input_ids = batch["input_ids"].cuda()
         attention_mask = batch["attention_mask"].cuda()
         position_ids = batch["position_ids"].cuda()
         loss_mask = batch.pop("loss_mask")[:, :-1].reshape(-1).cuda()
-        loss_fct = nn.CrossEntropyLoss(reduction="none")
 
         # Context manager for sequence parallel if needed
         context = nullcontext()
@@ -140,28 +149,10 @@ class FSDPEngine(Engine):
 
         valid_token_this_rank = torch.sum(loss_mask)
         dp_size = 1
-
         loss = torch.sum(loss) / (valid_token_this_rank + 1e-8) * dp_size
         outputs.loss = loss
         loss.backward()
 
-        return outputs
-        raise ValueError
-        rank = dist.get_rank()
-        input_ids = batch['input_ids'].to(rank)
-        attention_mask = batch['attention_mask'].to(rank)
-        labels = batch['labels'].to(rank)
-        outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
-        logits = outputs.logits
-        
-        # Shift logits and labels for next-token prediction
-        shift_logits = logits[:, :-1, :].contiguous()
-        shift_labels = labels[:, 1:].contiguous()
-        
-        # Compute loss
-        loss = self.loss_fn(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-        outputs.loss = loss
-        loss.backward()
         return outputs
 
 
@@ -170,10 +161,20 @@ class FSDPEngine(Engine):
 
 
     def optimizer_step(self):
-        self.optimizer.step()
+        assert self.config.optim.grad_clip is not None
+        grad_norm = self.fsdp_model.clip_grad_norm_(max_norm=self.config.optim.grad_clip)
+        # if grad_norm is not finite, skip the update
+        if not torch.isfinite(grad_norm):
+            print(f"WARN: grad_norm is not finite: {grad_norm}")
+            self.optimizer.zero_grad()
+        else:
+            self.optimizer.step()
+        return grad_norm
     
     def lr_scheduler_step(self):
-        pass
+        self.lr_scheduler.step()
+        lr = self.lr_scheduler.get_last_lr()[0]
+        return lr
 
     def set_loss_fn(self, loss_fn):
         self.loss_fn = loss_fn

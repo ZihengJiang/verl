@@ -5,7 +5,7 @@ class Engine(object):
     def init_model_and_optimizer(self):
         raise NotImplementedError
 
-    def forward_backward_step(self, batch):
+    def forward_backward_step(self, batch, forward_only=False):
         raise NotImplementedError
 
     def optimizer_zero_grad(self):
@@ -18,4 +18,7 @@ class Engine(object):
         raise NotImplementedError
     
     def set_loss_fn(self, loss_fn):
+        raise NotImplementedError
+
+    def get_state_dict(self):
         raise NotImplementedError
